@@ -1,66 +1,92 @@
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
+import pendulum
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-import psycopg2
+from airflow.providers.postgres.hooks.postgres import PostgresHook
 
-PG = dict(host="postgres", dbname="raw", user="postgres", password="postgres")
+def load_currency(**context):
+    t_start = context["data_interval_start"]
+    t_end   = context["data_interval_end"]
 
-def load_currency():
-    t_end = datetime.now(timezone.utc).replace(second=0, microsecond=0)
-    t_start = t_end - timedelta(minutes=3)
+    hook = PostgresHook(postgres_conn_id="postgres_raw")  # atau "POSTGRES_RAW" kalau id-mu huruf besar
+
     sql = """
+    -- Hapus window yang sama agar idempotent
+    DELETE FROM agg_currency_3m
+    WHERE window_start >= %(t_start)s AND window_start < %(t_end)s;
+
     WITH w AS (
-      SELECT
-        %(t_start)s AS window_start,
-        %(t_end)s   AS window_end,
-        base_currency, symbol,
-        MIN(fetched_at) AS first_ts,
-        MAX(fetched_at) AS last_ts,
-        COUNT(*) AS samples
-      FROM raw_currency
-      WHERE fetched_at >= %(t_start)s AND fetched_at < %(t_end)s
-      GROUP BY base_currency, symbol
+        SELECT
+            -- bucket 3 menit untuk tiap bar
+            (date_trunc('minute', r.fetched_at)
+             - make_interval(mins => MOD(extract(minute from r.fetched_at)::int, 3)))      AS window_start,
+            (date_trunc('minute', r.fetched_at)
+             - make_interval(mins => MOD(extract(minute from r.fetched_at)::int, 3))
+            ) + interval '3 minute'                                                         AS window_end,
+            r.base_currency,
+            r.symbol,
+            r.rate,
+            r.fetched_at
+        FROM raw_currency r
+        WHERE r.fetched_at >= %(t_start)s
+          AND r.fetched_at <  %(t_end)s
     ),
-    ohlc AS (
-      SELECT
-        w.window_start, w.window_end, rc.base_currency, rc.symbol, w.samples,
-        (SELECT rate FROM raw_currency r1
-          WHERE r1.base_currency=w.base_currency AND r1.symbol=w.symbol AND r1.fetched_at=w.first_ts
-          ORDER BY id ASC LIMIT 1) AS rate_open,
-        (SELECT rate FROM raw_currency r2
-          WHERE r2.base_currency=w.base_currency AND r2.symbol=w.symbol AND r2.fetched_at=w.last_ts
-          ORDER BY id DESC LIMIT 1) AS rate_close,
-        MIN(rc.rate) AS rate_min,
-        MAX(rc.rate) AS rate_max,
-        AVG(rc.rate) AS rate_avg
-      FROM w
-      JOIN raw_currency rc
-        ON rc.base_currency=w.base_currency AND rc.symbol=w.symbol
-       AND rc.fetched_at >= w.window_start AND rc.fetched_at < w.window_end
-      GROUP BY w.window_start, w.window_end, rc.base_currency, rc.symbol, w.samples, w.first_ts, w.last_ts
+    ordered AS (
+        SELECT
+            window_start, window_end, base_currency, symbol, rate, fetched_at,
+            row_number() OVER (PARTITION BY window_start, base_currency, symbol
+                               ORDER BY fetched_at ASC)  AS rn_open,
+            row_number() OVER (PARTITION BY window_start, base_currency, symbol
+                               ORDER BY fetched_at DESC) AS rn_close
+        FROM w
+    ),
+    agg AS (
+        SELECT
+            window_start,
+            window_end,
+            base_currency,
+            symbol,
+            MAX(rate) FILTER (WHERE rn_open  = 1) AS rate_open,
+            MAX(rate) FILTER (WHERE rn_close = 1) AS rate_close,
+            MIN(rate)                            AS rate_min,
+            MAX(rate)                            AS rate_max,
+            AVG(rate)                            AS rate_avg,
+            COUNT(*)                             AS samples
+        FROM ordered
+        GROUP BY window_start, window_end, base_currency, symbol
     )
-    INSERT INTO agg_currency_3m
-      (window_start, window_end, base_currency, symbol,
-       rate_open, rate_close, rate_min, rate_max, rate_avg, pct_change, samples)
+    INSERT INTO agg_currency_3m (
+        window_start, window_end, base_currency, symbol,
+        rate_open, rate_close, rate_min, rate_max, rate_avg, pct_change, samples
+    )
     SELECT
-      window_start, window_end, base_currency, symbol,
-      rate_open, rate_close, rate_min, rate_max, rate_avg,
-      CASE WHEN rate_open IS NULL OR rate_open=0 THEN NULL
-           ELSE (rate_close - rate_open) / rate_open END,
-      samples
-    FROM ohlc
-    ON CONFLICT (window_start, base_currency, symbol) DO NOTHING;
+        a.window_start,
+        a.window_end,
+        a.base_currency,
+        a.symbol,
+        a.rate_open,
+        a.rate_close,
+        a.rate_min,
+        a.rate_max,
+        a.rate_avg,
+        CASE
+            WHEN a.rate_open IS NULL OR a.rate_open = 0 THEN NULL
+            ELSE ((a.rate_close - a.rate_open) / a.rate_open) * 100.0
+        END AS pct_change,
+        a.samples
+    FROM agg a;
     """
-    conn = psycopg2.connect(**PG); conn.autocommit=True
-    cur = conn.cursor()
-    cur.execute(sql, {"t_start": t_start, "t_end": t_end})
-    cur.close(); conn.close()
+    hook.run(sql, parameters={"t_start": t_start, "t_end": t_end})
 
 with DAG(
     dag_id="agg_currency_3m",
-    schedule_interval="*/3 * * * *",
-    start_date=datetime(2025, 1, 1),
+    schedule="*/3 * * * *",
+    start_date=pendulum.datetime(2025, 1, 1, tz="UTC"),
     catchup=False,
-    default_args={"retries": 1, "retry_delay": timedelta(seconds=10)}
+    default_args={"retries": 1, "retry_delay": timedelta(seconds=10)},
+    tags=["forex"],
 ) as dag:
-    PythonOperator(task_id="transform_load_currency", python_callable=load_currency)
+    PythonOperator(
+        task_id="transform_load_currency",
+        python_callable=load_currency,
+    )
